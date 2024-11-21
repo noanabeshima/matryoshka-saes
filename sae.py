@@ -1,0 +1,331 @@
+import torch.nn.functional as F
+import torch.nn as nn
+import torch
+import numpy as np
+
+
+def get_wsd_scheduler(
+    optimizer, n_steps, end_lr_factor=0.1, n_warmup_steps=None, percent_cooldown=0.1
+):
+    """
+    See https://www.lighton.ai/lighton-blogs/passing-the-torch-training-a-mamba-model-for-smooth-handover
+    """
+    if n_warmup_steps is None:
+        n_warmup_steps = 0.05 * n_steps
+
+    def lr_lambda(step):
+        if step < n_warmup_steps:
+            return step / n_warmup_steps
+        elif step < (1 - percent_cooldown) * n_steps:
+            return 1
+        else:
+            return 1 - (1 - end_lr_factor) * min(
+                (step - (1 - percent_cooldown) * n_steps),
+                (1 - percent_cooldown) * n_steps,
+            ) / (percent_cooldown * n_steps + 1e-2)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def get_pareto_prefix_bounds(
+    n_latents: int,
+    n_prefixes: int,
+    min_prefix_length: int = 1,
+    pareto_power: float = 0.5,
+):
+    """
+    returns 1-d tensor of prefixes bounds
+
+    e.g. with n_latents = 10 and sampled prefixes [3,7,10]
+      this function would return torch.tensor([0, 3, 7, 10])
+    """
+    if n_prefixes == 1:
+        return torch.tensor([0, n_latents])
+    pareto_cdf = 1 - (
+        torch.arange(n_latents - min_prefix_length + 1)
+        / (n_latents - min_prefix_length + 1)
+    ) ** (pareto_power)
+    x = pareto_cdf
+
+    scaled_pdf = np.concatenate([np.zeros(min_prefix_length), x[1:] - x[:-1]], axis=0)
+    pdf = scaled_pdf / scaled_pdf.sum()
+
+    block_bounds = np.random.choice(
+        n_latents, size=n_prefixes - 1, replace=False, p=pdf
+    )
+    block_bounds.sort()
+    block_bounds = np.concatenate([[0], block_bounds, [n_latents]])
+    return torch.tensor(block_bounds)
+
+
+class RunningAvgNormalizer(nn.Module):
+    def __init__(self, alpha=0.99):
+        super().__init__()
+        self.running_avg = nn.Parameter(torch.zeros(1), requires_grad=False)
+        self.alpha = alpha
+
+    @torch.no_grad()
+    def normalize(self, x, update=False):
+        if update is True:
+            with torch.no_grad():
+                if self.running_avg is None:
+                    self.running_avg.data = x.norm(dim=-1).mean()
+                else:
+                    self.running_avg.data = (
+                        self.alpha * self.running_avg
+                        + (1 - self.alpha) * x.norm(dim=-1).mean()
+                    )
+        return x * (np.sqrt(x.shape[-1]) / self.running_avg.detach())
+
+    @torch.no_grad()
+    def unnormalize(self, x):
+        return x * (self.running_avg.detach() / np.sqrt(x.shape[-1]))
+
+
+class SparsityLossController(nn.Module):
+    """
+    Learns the appropriate sparsity regularization weight to hit a target l0.
+    This idea was shared with me by Glen Taggart.
+    """
+
+    def __init__(self, target_l0, warmup_steps=400, eps=0.0003):
+        super().__init__()
+        self.sparsity_loss_scale = 1.2
+        self.eps = eps
+        self.target_l0 = target_l0
+        self.step = 0
+        self.warmup_steps=warmup_steps
+
+    @torch.no_grad()
+    def forward(self, avg_l0, target_l0=None):
+        """
+        Given the avg_l0 on a batch, updates self.sparsity_loss_scale and returns the result
+        """
+        self.step += 1
+        target_l0 = self.target_l0 if target_l0 is None else target_l0
+
+        if self.step > self.warmup_steps:
+            if avg_l0 < target_l0:
+                self.sparsity_loss_scale *= 1 - self.eps
+            elif avg_l0 >= target_l0:
+                self.sparsity_loss_scale *= 1 + self.eps
+            return self.sparsity_loss_scale
+        else:
+            return self.sparsity_loss_scale*(self.step/self.warmup_steps)
+
+
+class MatryoshkaSAE(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        n_latents,
+        n_prefixes,
+        target_l0,
+        n_steps,
+        lr=3e-2,
+        permute_latents=True,
+        min_prefix_length=1,
+        sparsity_type='l1'
+    ):
+        super().__init__()
+
+        self.W_enc = nn.Parameter(torch.randn(d_model, n_latents) / (np.sqrt(d_model)))
+        self.b_enc = nn.Parameter(torch.zeros(n_latents))
+        self.W_dec = nn.Parameter(
+            (0.1 * self.W_enc.data / self.W_enc.data.norm(dim=0, keepdim=True)).T
+        )
+        self.b_dec = nn.Parameter(
+            torch.zeros(
+                d_model,
+            )
+        )
+
+        self.n_latents = n_latents
+        self.d_model = d_model
+        self.n_prefixes = n_prefixes
+        self.min_prefix_length = min_prefix_length
+        self.n_steps = n_steps
+
+        self.normalizer = RunningAvgNormalizer()
+        self.sparsity_controller = SparsityLossController(target_l0=target_l0, warmup_steps=self.n_steps*0.2)
+
+        self.optimizer = torch.optim.Adam(
+            self.parameters(), lr=lr, betas=(0.5, 0.9375)
+        )
+        self.scaler = torch.amp.GradScaler("cuda")
+        self.scheduler = get_wsd_scheduler(
+            self.optimizer,
+            n_steps=n_steps,
+            n_warmup_steps=100,
+            percent_cooldown=0.2,
+            end_lr_factor=0.1,
+        )
+
+        self.permute_latents = permute_latents
+        if self.permute_latents:
+            self.sq_act_running_avg = nn.Parameter(
+                torch.zeros(self.n_latents), requires_grad=False
+            )
+        
+        assert sparsity_type in {'l1', 'log'}
+        self.sparsity_type = sparsity_type
+
+    @property
+    def dtype(self):
+        return self.W_enc.dtype
+
+    @property
+    def device(self):
+        return self.W_enc.device
+
+    @torch.no_grad()
+    def get_acts(self, x, indices=None, normalize=True):
+        if normalize:
+            x = self.normalizer.normalize(x, update=False)
+        if isinstance(indices, int):
+            indices = [indices]
+        if indices is None:
+            preacts = x @ self.W_enc + self.b_enc
+            acts = torch.einsum("...d,d->...d", F.relu(preacts), self.W_dec.norm(dim=1))
+        else:
+            preacts = x @ self.W_enc[:, indices] + self.b_enc[indices]
+            acts = torch.einsum(
+                "...d,d->...d", F.relu(preacts), self.W_dec[indices].norm(dim=1)
+            )
+        return self.normalizer.unnormalize(acts)
+
+    def step(self, x, return_metrics=False):
+        x = self.normalizer.normalize(x, update=True)
+
+        # block_bounds = [0, prefix_0 end, prefix_1 end, ... prefix_n end]
+        block_bounds = get_pareto_prefix_bounds(
+            self.n_latents, self.n_prefixes, self.min_prefix_length
+        ).to(self.device)
+
+        acts = [
+            F.relu(
+                x @ self.W_enc[:, block_start:block_end]
+                + self.b_enc[block_start:block_end]
+            )
+            for block_start, block_end in zip(block_bounds[:-1], block_bounds[1:])
+        ]
+
+        # Get the norms of W_dec
+        W_dec_norms = self.W_dec.norm(dim=1)
+
+        # Instead of calculating prefix losses directly, split up into blocks
+        block_sparsity_losses, mse_contributions = [], []
+        for block_acts, block_start, block_end in zip(
+            acts, block_bounds[:-1], block_bounds[1:]
+        ):
+            normed_block_acts = block_acts * W_dec_norms[block_start:block_end][None]
+            if self.sparsity_type == 'log':
+                sparsity_loss = (
+                    (torch.log(normed_block_acts + 0.1) - np.log(0.1)).mean(dim=0)
+                ).sum(dim=-1)
+            elif self.sparsity_type == 'l1':
+                sparsity_loss = normed_block_acts.mean(dim=0).sum(dim=-1)
+            else:
+                assert False, f'unknown self.sparsity_type: {self.sparsity_type}'
+
+            block_sparsity_losses.append(sparsity_loss)
+
+            if self.permute_latents:
+                with torch.no_grad():
+                    mse_contributions.append((normed_block_acts**2).mean(dim=0))
+
+        if self.permute_latents:
+            with torch.no_grad():
+                mse_contributions = torch.cat(mse_contributions, dim=0)
+
+        block_outputs = [
+            block_acts @ self.W_dec[block_start:block_end]
+            for block_acts, block_start, block_end in zip(
+                acts, block_bounds[:-1], block_bounds[1:]
+            )
+        ]
+
+        with torch.no_grad():
+            avg_l0 = (
+                np.sum([(block_acts > 0).float().sum().cpu() for block_acts in acts])
+                / acts[0].shape[0]
+            )
+            sparsity_scale = self.sparsity_controller(avg_l0)
+
+            if self.permute_latents:
+                self.sq_act_running_avg.data = (
+                    0.95 * self.sq_act_running_avg.data + 0.05 * mse_contributions
+                )
+                latent_perm = torch.argsort(
+                    self.sq_act_running_avg.data, descending=True
+                )
+
+        sparsity_loss = torch.cumsum(torch.stack(block_sparsity_losses), dim=0).mean()
+
+        block_outputs[0] = block_outputs[0] + self.b_dec
+        prefix_preds = torch.cumsum(torch.stack(block_outputs), dim=0)
+
+        prefix_errs = ((prefix_preds - x[None]) ** 2).sum(dim=-1).mean(dim=-1)
+
+        recon_loss = prefix_errs.mean()
+
+        loss = recon_loss + sparsity_scale * sparsity_loss
+
+        result = {"loss": loss, "avg_l0": avg_l0, "sparsity_scale": sparsity_scale}
+
+        if return_metrics:
+            with torch.no_grad():
+                tot_var = ((x - x.mean(dim=0, keepdim=True)) ** 2).sum(dim=-1).mean()
+
+                # block preds: (block, batch, d_model)
+                block_errs = ((block_preds - x[None]) ** 2).sum(dim=-1).mean(dim=-1)
+
+                for i in range(block_preds.shape[0]):
+                    result[f"block_{i}_fvu"] = block_errs[i] / tot_var
+                result["last_block_fvu"] = block_errs[-1] / tot_var
+                block_sparsity_losses = [float(b) for b in block_sparsity_losses]
+                for i, b in enumerate(block_sparsity_losses):
+                    result[f"block_{i}_l1_loss"] = b
+
+        self.optimizer.zero_grad()
+        self.scaler.scale(loss).backward()
+
+        self.scaler.unscale_(self.optimizer)
+
+        # Clip gradients
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.scheduler.step()
+
+        if self.permute_latents:
+            # Permute W_dec, W_enc, and b_enc using the previously defined permutation
+            with torch.no_grad():
+                self.W_dec.data = self.W_dec.data[latent_perm]
+                self.W_enc.data = self.W_enc.data[:, latent_perm]
+                self.b_enc.data = self.b_enc.data[latent_perm]
+
+            # Permute optimizer state for W_dec, W_enc, and b_enc
+            for param_group in self.optimizer.param_groups:
+                for param in param_group["params"]:
+                    if param is self.W_dec and param in param_group.get("state", []):
+                        state = param_group.get("state", [])[param]
+                        if "exp_avg" in state:
+                            state["exp_avg"] = state["exp_avg"][latent_perm]
+                        if "exp_avg_sq" in state:
+                            state["exp_avg_sq"] = state["exp_avg_sq"][latent_perm]
+                    elif param is self.W_enc and param in param_group.get("state", []):
+                        state = param_group.get("state", [])[param]
+                        if "exp_avg" in state:
+                            state["exp_avg"] = state["exp_avg"][:, latent_perm]
+                        if "exp_avg_sq" in state:
+                            state["exp_avg_sq"] = state["exp_avg_sq"][:, latent_perm]
+                    elif param is self.b_enc and param in param_group.get("state", []):
+                        state = param_group.get("state", [])[param]
+                        if "exp_avg" in state:
+                            state["exp_avg"] = state["exp_avg"][latent_perm]
+                        if "exp_avg_sq" in state:
+                            state["exp_avg_sq"] = state["exp_avg_sq"][latent_perm]
+
+        return result

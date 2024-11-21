@@ -1,0 +1,50 @@
+{
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "title": "tree",
+    "description": "Feature tree",
+    "type": "object",
+    "properties": {
+        "active_prob": {
+            "description": "Probability this feature is active conditional on its parent being active",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+        },
+        "id": {
+            "description": "Feature name",
+            "type": "string"
+        },
+        "mutually_exclusive_children": {
+            "description": "Are the feature's children mutually exclusive?",
+            "type": "boolean",
+            "default": false
+        },
+        "is_binary": {
+            "description": "Is this feature binary?",
+            "type": "boolean",
+            "default": true
+        },
+        "is_read_out": {
+            "description": "Is this feature read-out?",
+            "type": "boolean",
+            "default": true
+        },
+        "children": {
+            "description": "Child features",
+            "type": "array",
+            "items": {
+                "$ref": "#/definitions/tree"
+            },
+            "default": []
+        }
+    },
+    "required": [
+        "active_prob"
+    ],
+    "additionalProperties": false,
+    "definitions": {
+        "tree": {
+            "$ref": "#"
+        }
+    }
+}
