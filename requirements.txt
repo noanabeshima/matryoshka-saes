@@ -6,3 +6,4 @@ nbformat
 plotly  # For the heatmap visualization
 ipython # For IPython.display
 scipy # For linear_sum_assignment
+kaleido # For saving plotly figures as PNG files
