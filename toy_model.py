@@ -1,10 +1,5 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import torch.distributions as dists
 from torch.utils.data import Dataset
-
 import jsonschema
 import json
 import numpy as np
@@ -28,7 +23,9 @@ class Tree:
         assert "active_prob" in tree_dict
         self.active_prob = tree_dict["active_prob"]
         self.is_read_out = tree_dict.get("is_read_out", True)
-        self.mutually_exclusive_children = tree_dict.get("mutually_exclusive_children", False)
+        self.mutually_exclusive_children = tree_dict.get(
+            "mutually_exclusive_children", False
+        )
         self.id = tree_dict.get("id", None)
 
         self.is_binary = tree_dict.get("is_binary", True)
@@ -111,15 +108,15 @@ class Tree:
                 self.mutually_exclusive_children and child != active_child
             )
 
-            child_force_active = self.mutually_exclusive_children and child == active_child
+            child_force_active = (
+                self.mutually_exclusive_children and child == active_child
+            )
 
             sample += child.sample(
                 force_inactive=child_force_inactive, force_active=child_force_active
             )
 
         return sample
-
-
 
 
 class TreeDataset(Dataset):
@@ -134,7 +131,7 @@ class TreeDataset(Dataset):
 
     def __getitem__(self, idx):
         true_acts = self.tree.sample(self.batch_size)
-        random_scale = 1+torch.randn_like(true_acts, device=self.true_feats.device) * 0.05
-        true_acts = true_acts * random_scale
+        # random_scale = 1+torch.randn_like(true_acts, device=self.true_feats.device) * 0.05
+        # true_acts = true_acts * random_scale
         x = true_acts @ self.true_feats
         return x

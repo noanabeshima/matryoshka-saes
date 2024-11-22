@@ -88,30 +88,36 @@ class SparsityLossController(nn.Module):
     This idea was shared with me by Glen Taggart.
     """
 
-    def __init__(self, target_l0, warmup_steps=400, eps=0.0003):
+    def __init__(
+        self, target_l0, starting_sparsity_loss_scale=1.2, warmup_steps=400, eps=0.0003
+    ):
         super().__init__()
-        self.sparsity_loss_scale = 1.2
+        self.sparsity_loss_scale = starting_sparsity_loss_scale
         self.eps = eps
         self.target_l0 = target_l0
         self.step = 0
-        self.warmup_steps=warmup_steps
+        self.warmup_steps = warmup_steps
 
     @torch.no_grad()
-    def forward(self, avg_l0, target_l0=None):
+    def forward(self, avg_l0=None):
         """
-        Given the avg_l0 on a batch, updates self.sparsity_loss_scale and returns the result
+        Given the avg_l0 on a batch, updates self.sparsity_loss_scale and returns the result.
+        If avg_l0 is None, returns the current sparsity loss scale without updating it.
         """
-        self.step += 1
-        target_l0 = self.target_l0 if target_l0 is None else target_l0
+        if avg_l0 is None:
+            # Return current sparsity loss scale without updating it
+            return self.sparsity_loss_scale * min(self.step / self.warmup_steps, 1)
 
         if self.step > self.warmup_steps:
-            if avg_l0 < target_l0:
+            # Update sparsity loss scale
+            if avg_l0 < self.target_l0:
                 self.sparsity_loss_scale *= 1 - self.eps
-            elif avg_l0 >= target_l0:
+            elif avg_l0 >= self.target_l0:
                 self.sparsity_loss_scale *= 1 + self.eps
-            return self.sparsity_loss_scale
-        else:
-            return self.sparsity_loss_scale*(self.step/self.warmup_steps)
+        
+        self.step += 1
+        
+        return self.sparsity_loss_scale * min(self.step / self.warmup_steps, 1)
 
 
 class MatryoshkaSAE(nn.Module):
@@ -125,7 +131,8 @@ class MatryoshkaSAE(nn.Module):
         lr=3e-2,
         permute_latents=True,
         min_prefix_length=1,
-        sparsity_type='l1'
+        sparsity_type="l1",
+        starting_sparsity_loss_scale=1.2,
     ):
         super().__init__()
 
@@ -147,11 +154,14 @@ class MatryoshkaSAE(nn.Module):
         self.n_steps = n_steps
 
         self.normalizer = RunningAvgNormalizer()
-        self.sparsity_controller = SparsityLossController(target_l0=target_l0, warmup_steps=self.n_steps*0.2)
 
-        self.optimizer = torch.optim.Adam(
-            self.parameters(), lr=lr, betas=(0.5, 0.9375)
+        self.sparsity_controller = SparsityLossController(
+            target_l0=target_l0,
+            warmup_steps=int(self.n_steps * 0.2),
+            starting_sparsity_loss_scale=starting_sparsity_loss_scale,
         )
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, betas=(0.5, 0.9375))
         self.scaler = torch.amp.GradScaler("cuda")
         self.scheduler = get_wsd_scheduler(
             self.optimizer,
@@ -166,8 +176,8 @@ class MatryoshkaSAE(nn.Module):
             self.sq_act_running_avg = nn.Parameter(
                 torch.zeros(self.n_latents), requires_grad=False
             )
-        
-        assert sparsity_type in {'l1', 'log'}
+
+        assert sparsity_type in {"l1", "log"}
         self.sparsity_type = sparsity_type
 
     @property
@@ -219,14 +229,14 @@ class MatryoshkaSAE(nn.Module):
             acts, block_bounds[:-1], block_bounds[1:]
         ):
             normed_block_acts = block_acts * W_dec_norms[block_start:block_end][None]
-            if self.sparsity_type == 'log':
+            if self.sparsity_type == "log":
                 sparsity_loss = (
                     (torch.log(normed_block_acts + 0.1) - np.log(0.1)).mean(dim=0)
                 ).sum(dim=-1)
-            elif self.sparsity_type == 'l1':
+            elif self.sparsity_type == "l1":
                 sparsity_loss = normed_block_acts.mean(dim=0).sum(dim=-1)
             else:
-                assert False, f'unknown self.sparsity_type: {self.sparsity_type}'
+                assert False, f"unknown self.sparsity_type: {self.sparsity_type}"
 
             block_sparsity_losses.append(sparsity_loss)
 
@@ -278,9 +288,9 @@ class MatryoshkaSAE(nn.Module):
                 tot_var = ((x - x.mean(dim=0, keepdim=True)) ** 2).sum(dim=-1).mean()
 
                 # block preds: (block, batch, d_model)
-                block_errs = ((block_preds - x[None]) ** 2).sum(dim=-1).mean(dim=-1)
+                block_errs = ((block_outputs - x[None]) ** 2).sum(dim=-1).mean(dim=-1)
 
-                for i in range(block_preds.shape[0]):
+                for i in range(block_outputs.shape[0]):
                     result[f"block_{i}_fvu"] = block_errs[i] / tot_var
                 result["last_block_fvu"] = block_errs[-1] / tot_var
                 block_sparsity_losses = [float(b) for b in block_sparsity_losses]
