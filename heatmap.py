@@ -1,7 +1,7 @@
 import plotly.graph_objects as go
 
 
-def heatmap(data, title=None, x_axis=False, y_axis=False):
+def heatmap(data, title=None, dim_names=(None, None)):
     """
     Creates a simple heatmap visualization from a 2D array.
 
@@ -14,20 +14,22 @@ def heatmap(data, title=None, x_axis=False, y_axis=False):
     Returns:
         plotly.graph_objects.Figure object
     """
-    fig = go.Figure(data=go.Heatmap(z=data, colorscale="Viridis"))
+    fig = go.Figure(
+        data=go.Heatmap(z=data, colorscale="Viridis"),
+        layout=go.Layout(yaxis=dict(autorange="reversed"))
+    )
 
     if title:
         fig.update_layout(title=title)
 
-    x_label = x_axis if x_axis else f"col ({data.shape[1]})"
-    y_label = y_axis if y_axis else f"row ({data.shape[0]})"
+    row_label = f"{dim_names[0]} ({data.shape[0]})" if dim_names[0] is not None else f"row ({data.shape[0]})"
+    col_label = f"{dim_names[1]} ({data.shape[1]})" if dim_names[1] is not None else f"col ({data.shape[1]})"
 
     fig.update_layout(
-        yaxis=dict(autorange="reversed"),
-        xaxis_title=x_label,
-        yaxis_title=y_label,
-        height=700,  # Make the plot tall
-        width=1000,  # Keep width relatively narrow for tall aspect ratio
+        xaxis_title=col_label,
+        yaxis_title=row_label,
+        height=600,
+        width=1000,
     )
 
     fig.update_yaxes(showticklabels=False)
