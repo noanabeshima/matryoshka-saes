@@ -16,20 +16,28 @@ def heatmap(data, title=None, dim_names=(None, None)):
     """
     fig = go.Figure(
         data=go.Heatmap(z=data, colorscale="Viridis"),
-        layout=go.Layout(yaxis=dict(autorange="reversed"))
+        layout=go.Layout(yaxis=dict(autorange="reversed")),
     )
 
     if title:
         fig.update_layout(title=title)
 
-    row_label = f"{dim_names[0]} ({data.shape[0]})" if dim_names[0] is not None else f"row ({data.shape[0]})"
-    col_label = f"{dim_names[1]} ({data.shape[1]})" if dim_names[1] is not None else f"col ({data.shape[1]})"
+    row_label = (
+        f"{dim_names[0]} ({data.shape[0]})"
+        if dim_names[0] is not None
+        else f"row ({data.shape[0]})"
+    )
+    col_label = (
+        f"{dim_names[1]} ({data.shape[1]})"
+        if dim_names[1] is not None
+        else f"col ({data.shape[1]})"
+    )
 
     fig.update_layout(
         xaxis_title=col_label,
         yaxis_title=row_label,
         height=600,
-        width=1000,
+        width=1400,
     )
 
     fig.update_yaxes(showticklabels=False)

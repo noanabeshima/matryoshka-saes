@@ -27,35 +27,82 @@ def get_wsd_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-def get_pareto_prefix_bounds(
+# def get_pareto_prefix_bounds(
+#     n_latents: int,
+#     n_prefixes: int,
+#     min_prefix_length: int = 1,
+#     pareto_power: float = 0.5,
+# ):
+#     """
+#     returns 1-d tensor of prefixes bounds
+
+#     e.g. with n_latents = 10 and sampled prefixes [3,7,10]
+#       this function would return torch.tensor([0, 3, 7, 10])
+#     """
+#     if n_prefixes == 1:
+#         return torch.tensor([0, n_latents])
+#     pareto_cdf = 1 - (
+#         torch.arange(n_latents - min_prefix_length + 1)
+#         / (n_latents - min_prefix_length + 1)
+#     ) ** (pareto_power)
+#     x = pareto_cdf
+
+#     scaled_pdf = np.concatenate([np.zeros(min_prefix_length), x[1:] - x[:-1]], axis=0)
+#     pdf = scaled_pdf / scaled_pdf.sum()
+
+#     block_bounds = np.random.choice(
+#         n_latents, size=n_prefixes - 1, replace=False, p=pdf
+#     )
+#     block_bounds.sort()
+#     block_bounds = np.concatenate([[0], block_bounds, [n_latents]])
+#     return torch.tensor(block_bounds)
+
+
+def sample_prefixes(
     n_latents: int,
     n_prefixes: int,
     min_prefix_length: int = 1,
     pareto_power: float = 0.5,
-):
+) -> torch.Tensor:
     """
-    returns 1-d tensor of prefixes bounds
+    Samples prefix lengths using a Pareto distribution to favor shorter prefixes.
 
-    e.g. with n_latents = 10 and sampled prefixes [3,7,10]
-      this function would return torch.tensor([0, 3, 7, 10])
+    Args:
+        n_latents: Total number of latent dimensions
+        n_prefixes: Number of prefixes to sample
+        min_prefix_length: Minimum length of any prefix
+        pareto_power: Power parameter for Pareto distribution (lower = more uniform)
+
+    Returns:
+        torch.Tensor: Sorted prefix lengths
+        Example: with n_latents=10 might return [3, 7, 10]
     """
     if n_prefixes == 1:
-        return torch.tensor([0, n_latents])
-    pareto_cdf = 1 - (
-        torch.arange(n_latents - min_prefix_length + 1)
-        / (n_latents - min_prefix_length + 1)
-    ) ** (pareto_power)
-    x = pareto_cdf
+        return torch.tensor([n_latents])
 
-    scaled_pdf = np.concatenate([np.zeros(min_prefix_length), x[1:] - x[:-1]], axis=0)
-    pdf = scaled_pdf / scaled_pdf.sum()
-
-    block_bounds = np.random.choice(
-        n_latents, size=n_prefixes - 1, replace=False, p=pdf
+    # Calculate probability distribution favoring shorter prefixes
+    possible_lengths = torch.arange(n_latents - min_prefix_length + 1)
+    pareto_cdf = (
+        1 - (possible_lengths / (n_latents - min_prefix_length + 1)) ** pareto_power
     )
-    block_bounds.sort()
-    block_bounds = np.concatenate([[0], block_bounds, [n_latents]])
-    return torch.tensor(block_bounds)
+
+    # Convert CDF to PDF
+    pareto_pdf = np.concatenate(
+        [np.zeros(min_prefix_length), pareto_cdf[1:] - pareto_cdf[:-1]]
+    )
+    probability_dist = pareto_pdf / pareto_pdf.sum()
+
+    # Sample and sort prefix lengths
+    prefixes = np.random.choice(
+        n_latents, size=n_prefixes - 1, replace=False, p=probability_dist
+    )
+
+    # Add n_latents as the final prefix
+    prefixes = np.append(prefixes, n_latents)
+
+    prefixes.sort()
+
+    return torch.tensor(prefixes)
 
 
 class RunningAvgNormalizer(nn.Module):
@@ -82,7 +129,7 @@ class RunningAvgNormalizer(nn.Module):
         return x * (self.running_avg.detach() / np.sqrt(x.shape[-1]))
 
 
-class SparsityLossController(nn.Module):
+class AdaptiveSparsityController(nn.Module):
     """
     Learns the appropriate sparsity regularization weight to hit a target l0.
     This idea was shared with me by Glen Taggart.
@@ -114,9 +161,9 @@ class SparsityLossController(nn.Module):
                 self.sparsity_loss_scale *= 1 - self.eps
             elif avg_l0 >= self.target_l0:
                 self.sparsity_loss_scale *= 1 + self.eps
-        
+
         self.step += 1
-        
+
         return self.sparsity_loss_scale * min(self.step / self.warmup_steps, 1)
 
 
@@ -155,7 +202,7 @@ class MatryoshkaSAE(nn.Module):
 
         self.normalizer = RunningAvgNormalizer()
 
-        self.sparsity_controller = SparsityLossController(
+        self.sparsity_controller = AdaptiveSparsityController(
             target_l0=target_l0,
             warmup_steps=int(self.n_steps * 0.2),
             starting_sparsity_loss_scale=starting_sparsity_loss_scale,
@@ -207,10 +254,10 @@ class MatryoshkaSAE(nn.Module):
     def step(self, x, return_metrics=False):
         x = self.normalizer.normalize(x, update=True)
 
-        # block_bounds = [0, prefix_0 end, prefix_1 end, ... prefix_n end]
-        block_bounds = get_pareto_prefix_bounds(
+        prefixes = sample_prefixes(
             self.n_latents, self.n_prefixes, self.min_prefix_length
         ).to(self.device)
+        block_bounds = torch.cat([torch.tensor([0]).to(self.device), prefixes])
 
         acts = [
             F.relu(
@@ -223,7 +270,6 @@ class MatryoshkaSAE(nn.Module):
         # Get the norms of W_dec
         W_dec_norms = self.W_dec.norm(dim=1)
 
-        # Instead of calculating prefix losses directly, split up into blocks
         block_sparsity_losses, mse_contributions = [], []
         for block_acts, block_start, block_end in zip(
             acts, block_bounds[:-1], block_bounds[1:]
@@ -236,7 +282,9 @@ class MatryoshkaSAE(nn.Module):
             elif self.sparsity_type == "l1":
                 sparsity_loss = normed_block_acts.mean(dim=0).sum(dim=-1)
             else:
-                assert False, f"unknown self.sparsity_type: {self.sparsity_type}"
+                raise ValueError(
+                    f"Unknown sparsity_type '{self.sparsity_type}'. Expected one of: 'l1', 'log'"
+                )
 
             block_sparsity_losses.append(sparsity_loss)
 
