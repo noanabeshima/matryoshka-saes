@@ -27,37 +27,6 @@ def get_wsd_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-# def get_pareto_prefix_bounds(
-#     n_latents: int,
-#     n_prefixes: int,
-#     min_prefix_length: int = 1,
-#     pareto_power: float = 0.5,
-# ):
-#     """
-#     returns 1-d tensor of prefixes bounds
-
-#     e.g. with n_latents = 10 and sampled prefixes [3,7,10]
-#       this function would return torch.tensor([0, 3, 7, 10])
-#     """
-#     if n_prefixes == 1:
-#         return torch.tensor([0, n_latents])
-#     pareto_cdf = 1 - (
-#         torch.arange(n_latents - min_prefix_length + 1)
-#         / (n_latents - min_prefix_length + 1)
-#     ) ** (pareto_power)
-#     x = pareto_cdf
-
-#     scaled_pdf = np.concatenate([np.zeros(min_prefix_length), x[1:] - x[:-1]], axis=0)
-#     pdf = scaled_pdf / scaled_pdf.sum()
-
-#     block_bounds = np.random.choice(
-#         n_latents, size=n_prefixes - 1, replace=False, p=pdf
-#     )
-#     block_bounds.sort()
-#     block_bounds = np.concatenate([[0], block_bounds, [n_latents]])
-#     return torch.tensor(block_bounds)
-
-
 def sample_prefixes(
     n_latents: int,
     n_prefixes: int,
