@@ -63,60 +63,77 @@ class Tree:
 
     @property
     def n_features(self):
-        return len(self.sample())
+        count = 1 if self.is_read_out else 0
+        for child in self.children:
+            count += child.n_features
+        return count
 
     @property
     def child_probs(self):
         return torch.tensor([child.active_prob for child in self.children])
 
-    def sample(self, shape=None, force_inactive=False, force_active=False):
-        assert not (force_inactive and force_active)
+    @torch.no_grad()
+    def sample(self, batch_size: int) -> torch.Tensor:
+        batch = torch.zeros((batch_size, self.n_features))
+        self._fill_batch(batch)
+        return batch
 
-        # special sampling for shape argument
-        if shape is not None:
-            if isinstance(shape, int):
-                shape = (shape,)
-            n_samples = np.prod(shape)
-            samples = [self.sample() for _ in range(n_samples)]
-            return torch.tensor(samples).view(*shape, -1).float()
-
-        sample = []
-
-        # is this feature active?
-        is_active = (
-            (torch.rand(1) <= self.active_prob).item() * (1 - (force_inactive))
-            if not force_active
-            else 1
+    def _fill_batch(
+        self,
+        batch: torch.Tensor,
+        parent_feats_mask: torch.Tensor | None = None,
+        force_active_mask: torch.Tensor | None = None,
+        force_inactive_mask: torch.Tensor | None = None,
+    ):
+        batch_size = batch.shape[0]
+        is_active = _sample_is_active(
+            self.active_prob,
+            batch_size=batch_size,
+            parent_feats_mask=parent_feats_mask,
+            force_active_mask=force_active_mask,
+            force_inactive_mask=force_inactive_mask,
         )
 
         # append something if this is a readout
         if self.is_read_out:
-            if self.is_binary:
-                sample.append(is_active)
-            else:
-                sample.append((is_active * torch.rand(1)))
+            batch[:, self.index] = is_active
 
+        active_child = None
         if self.mutually_exclusive_children:
-            active_child = (
-                np.random.choice(self.children, p=self.child_probs)
-                if is_active
-                else None
-            )
+            active_child = torch.multinomial(
+                self.child_probs.expand(batch_size, -1), 1
+            ).squeeze(-1)
 
-        for child in self.children:
-            child_force_inactive = not bool(is_active) or (
-                self.mutually_exclusive_children and child != active_child
+        for child_idx, child in enumerate(self.children):
+            child_force_inactive = (
+                None if active_child is None else active_child != child_idx
             )
-
             child_force_active = (
-                self.mutually_exclusive_children and child == active_child
+                None if active_child is None else active_child == child_idx
+            )
+            child._fill_batch(
+                batch,
+                parent_feats_mask=is_active,
+                force_active_mask=child_force_active,
+                force_inactive_mask=child_force_inactive,
             )
 
-            sample += child.sample(
-                force_inactive=child_force_inactive, force_active=child_force_active
-            )
 
-        return sample
+def _sample_is_active(
+    active_prob,
+    batch_size: int,
+    parent_feats_mask: torch.Tensor | None,
+    force_active_mask: torch.Tensor | None,
+    force_inactive_mask: torch.Tensor | None,
+):
+    is_active = torch.bernoulli(torch.tensor(active_prob).expand(batch_size))
+    if force_active_mask is not None:
+        is_active[force_active_mask] = 1
+    if force_inactive_mask is not None:
+        is_active[force_inactive_mask] = 0
+    if parent_feats_mask is not None:
+        is_active[parent_feats_mask == 0] = 0
+    return is_active
 
 
 class TreeDataset(Dataset):
