@@ -84,8 +84,9 @@ class RunningAvgNormalizer(nn.Module):
     def normalize(self, x, update=False):
         if update is True:
             with torch.no_grad():
-                if self.running_avg is None:
-                    self.running_avg.data = x.norm(dim=-1).mean()
+                if self.running_avg.item() == 0:
+                    # First update: start from this batch's mean norm, not from 0
+                    self.running_avg.data = x.norm(dim=-1).mean().reshape(1)
                 else:
                     self.running_avg.data = (
                         self.alpha * self.running_avg
@@ -333,26 +334,15 @@ class MatryoshkaSAE(nn.Module):
                 self.W_enc.data = self.W_enc.data[:, latent_perm]
                 self.b_enc.data = self.b_enc.data[latent_perm]
 
-            # Permute optimizer state for W_dec, W_enc, and b_enc
-            for param_group in self.optimizer.param_groups:
-                for param in param_group["params"]:
-                    if param is self.W_dec and param in param_group.get("state", []):
-                        state = param_group.get("state", [])[param]
-                        if "exp_avg" in state:
-                            state["exp_avg"] = state["exp_avg"][latent_perm]
-                        if "exp_avg_sq" in state:
-                            state["exp_avg_sq"] = state["exp_avg_sq"][latent_perm]
-                    elif param is self.W_enc and param in param_group.get("state", []):
-                        state = param_group.get("state", [])[param]
-                        if "exp_avg" in state:
-                            state["exp_avg"] = state["exp_avg"][:, latent_perm]
-                        if "exp_avg_sq" in state:
-                            state["exp_avg_sq"] = state["exp_avg_sq"][:, latent_perm]
-                    elif param is self.b_enc and param in param_group.get("state", []):
-                        state = param_group.get("state", [])[param]
-                        if "exp_avg" in state:
-                            state["exp_avg"] = state["exp_avg"][latent_perm]
-                        if "exp_avg_sq" in state:
-                            state["exp_avg_sq"] = state["exp_avg_sq"][latent_perm]
+                # Keep each latent's running average with the latent
+                self.sq_act_running_avg.data = self.sq_act_running_avg.data[latent_perm]
+
+                # Permute optimizer state for W_dec, W_enc, and b_enc
+                # (Adam keeps its moments in optimizer.state[param])
+                for param, dim in ((self.W_dec, 0), (self.W_enc, 1), (self.b_enc, 0)):
+                    state = self.optimizer.state.get(param, {})
+                    for key in ("exp_avg", "exp_avg_sq"):
+                        if key in state:
+                            state[key] = state[key].index_select(dim, latent_perm)
 
         return result
